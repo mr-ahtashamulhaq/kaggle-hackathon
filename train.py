@@ -17,6 +17,22 @@ def main():
     train = pd.read_csv(train_path)
     test = pd.read_csv(test_path)
     
+    # --- FEATURE ENGINEERING ---
+    def create_features(df):
+        # Prevent division by zero
+        df['calorie_per_step'] = df['calorie_expenditure'] / (df['step_count'] + 1)
+        df['steps_per_exercise'] = df['step_count'] / (df['exercise_duration'] + 1)
+        df['water_per_calorie'] = df['water_intake'] / (df['calorie_expenditure'] + 1)
+        
+        # Categorical interactions
+        df['stress_sleep'] = df['stress_level'].astype(str) + "_" + df['sleep_quality'].astype(str)
+        df['diet_activity'] = df['diet_type'].astype(str) + "_" + df['physical_activity_level'].astype(str)
+        return df
+
+    print("Creating new features...")
+    train = create_features(train)
+    test = create_features(test)
+    
     target_col = 'health_condition'
     features = [c for c in train.columns if c not in ['id', target_col]]
     
@@ -25,7 +41,8 @@ def main():
     train[target_col] = le.fit_transform(train[target_col])
     
     categorical_cols = ['diet_type', 'stress_level', 'sleep_quality', 
-                        'physical_activity_level', 'smoking_alcohol', 'gender']
+                        'physical_activity_level', 'smoking_alcohol', 'gender',
+                        'stress_sleep', 'diet_activity']
     
     # Convert categorical to 'category' dtype for LightGBM
     for col in categorical_cols:
@@ -47,9 +64,12 @@ def main():
             objective='multiclass',
             random_state=42,
             class_weight='balanced',
-            n_estimators=1000,
-            learning_rate=0.05,
-            num_leaves=31,
+            n_estimators=1500,
+            learning_rate=0.03,
+            num_leaves=63,
+            max_depth=8,
+            colsample_bytree=0.8,
+            subsample=0.8,
             n_jobs=-1
         )
         
