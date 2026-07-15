@@ -110,37 +110,39 @@ def main():
         X_valid = X_valid.drop(columns=numeric_te_cols).join(te_valid)
         X_test = X_test.drop(columns=numeric_te_cols).join(te_test_arr)
 
-        # --- HistGradientBoostingClassifier ---
+        # --- HistGradientBoostingClassifier with Seed Averaging ---
         # Proven breakthrough model (Mark Susol v0.7, 0.95036 LB)
-        # Native NaN handling, different split strategy from LGBM/CB/XGB
-        # No class_weight — we use Prior-Correction instead (proven better)
-        hgbc = HistGradientBoostingClassifier(
-            max_iter=500,
-            learning_rate=0.05,
-            max_leaf_nodes=63,
-            max_depth=None,
-            min_samples_leaf=20,
-            l2_regularization=0.1,
-            early_stopping=True,
-            validation_fraction=0.1,
-            n_iter_no_change=30,
-            random_state=42,
-            verbose=0,
-            categorical_features=categorical_cols
-        )
+        # Fix 1: No internal early-stopping validation split — train on full fold data.
+        #         Model was stopping at 127-167 iters, so max_iter=220 is sufficient.
+        # Fix 2: Seed averaging (3 seeds) — reduces the 0.005 fold variance we observed
+        #         without changing model architecture or creating ensemble diversity trap.
+        seeds = [42, 123, 456]
+        fold_val_proba = np.zeros((len(valid_idx), len(le.classes_)))
+        fold_test_proba = np.zeros((len(X_test), len(le.classes_)))
 
-        hgbc.fit(X_train, y_train)
-        print(f"   HGBC stopped at {hgbc.n_iter_} iterations.")
+        for seed in seeds:
+            hgbc = HistGradientBoostingClassifier(
+                max_iter=220,
+                learning_rate=0.05,
+                max_leaf_nodes=63,
+                max_depth=None,
+                min_samples_leaf=20,
+                l2_regularization=0.1,
+                early_stopping=False,   # use all fold training data
+                random_state=seed,
+                verbose=0,
+                categorical_features=categorical_cols
+            )
+            hgbc.fit(X_train, y_train)
+            fold_val_proba += hgbc.predict_proba(X_valid) / len(seeds)
+            fold_test_proba += hgbc.predict_proba(X_test) / len(seeds)
 
         # Prior-Correction: divide raw probabilities by class priors, then renormalize
-        # This is better than class_weight for Balanced Accuracy (proven across all discussion posts)
-        raw_val = hgbc.predict_proba(X_valid)
-        corrected_val = raw_val / class_priors
+        corrected_val = fold_val_proba / class_priors
         corrected_val = corrected_val / corrected_val.sum(axis=1, keepdims=True)
         oof_preds[valid_idx] = corrected_val
 
-        raw_test = hgbc.predict_proba(X_test)
-        corrected_test = raw_test / class_priors
+        corrected_test = fold_test_proba / class_priors
         corrected_test = corrected_test / corrected_test.sum(axis=1, keepdims=True)
         test_preds += corrected_test / skf.n_splits
 
