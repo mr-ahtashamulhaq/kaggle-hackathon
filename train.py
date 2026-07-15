@@ -4,11 +4,13 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.preprocessing import LabelEncoder, TargetEncoder
+import optuna
 import warnings
 warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
 
 def main():
-    # Kaggle cloud environment paths
     submission_path = '/kaggle/working/submission.csv'
     train_path = "/kaggle/input/competitions/playground-series-s6e7/train.csv"
     test_path = "/kaggle/input/competitions/playground-series-s6e7/test.csv"
@@ -17,12 +19,9 @@ def main():
     train = pd.read_csv(train_path)
     test = pd.read_csv(test_path)
 
-    # --- FEATURE ENGINEERING ---
-    # Keep only categorical interactions that are proven to carry signal
     def create_features(df):
         df['stress_sleep'] = df['stress_level'].astype(str) + "_" + df['sleep_quality'].astype(str)
         df['diet_activity'] = df['diet_type'].astype(str) + "_" + df['physical_activity_level'].astype(str)
-        # Confirmed strongest signal from community (Rugved Bane, 0.95014)
         df['stress_activity'] = df['stress_level'].astype(str) + "_" + df['physical_activity_level'].astype(str)
         return df
 
@@ -31,139 +30,132 @@ def main():
     test = create_features(test)
 
     target_col = 'health_condition'
-
-    # Label encode target
     le = LabelEncoder()
     train[target_col] = le.fit_transform(train[target_col])
 
-    # Separate numeric and categorical columns
-    # HGBC handles categoricals natively via integer encoding
     categorical_cols = [
         'diet_type', 'stress_level', 'sleep_quality',
         'physical_activity_level', 'smoking_alcohol', 'gender',
         'stress_sleep', 'diet_activity', 'stress_activity'
     ]
-    # Numeric cols to apply exact-value TargetEncoding (proven +0.0009 by Mark Susol)
     numeric_te_cols = [
         'sleep_duration', 'heart_rate', 'bmi',
         'calorie_expenditure', 'step_count', 'exercise_duration', 'water_intake'
     ]
 
-    # Encode categoricals as integer codes for HGBC
     for col in categorical_cols:
         train[col] = train[col].astype('category').cat.codes.astype('int16')
         test[col] = test[col].astype('category').cat.codes.astype('int16')
 
-    # Explicit missingness indicators
-    # The MNAR signal is real (community-proven). HGBC learns it implicitly via split
-    # directions, but making it an explicit binary feature gives the model a direct handle.
-    nan_indicator_cols = []
-    for col in numeric_te_cols:
-        nan_col = f'{col}_is_nan'
-        train[nan_col] = train[col].isna().astype(np.int8)
-        test[nan_col] = test[col].isna().astype(np.int8)
-        nan_indicator_cols.append(nan_col)
-
     features = [c for c in train.columns if c not in ['id', target_col]]
-
-    print(f"Total features: {len(features)}")
-    print("Starting Stratified K-Fold (K=7) with HGBC + exact-value TargetEncoding...")
-
-    # Use 7 folds — more folds = more stable OOF estimate on 690k rows
-    skf = StratifiedKFold(n_splits=7, shuffle=True, random_state=42)
-
-    oof_preds = np.zeros((len(train), len(le.classes_)))
-    test_preds = np.zeros((len(test), len(le.classes_)))
-
-    # Calculate class priors for Prior-Correction (proven better than class_weight)
+    n_classes = len(le.classes_)
+    te_col_names = [f'{col}_TE_cls{c}' for col in numeric_te_cols for c in range(n_classes)]
     class_priors = train[target_col].value_counts(normalize=True).sort_index().values
-    print(f"Class priors (sorted by label index): {class_priors.round(4)}")
+
+    def apply_te_and_get_splits(X_tr, y_tr, X_vl, X_ts):
+        te = TargetEncoder(target_type='multiclass', smooth='auto', cv=5, random_state=42)
+        tr_te = pd.DataFrame(te.fit_transform(X_tr[numeric_te_cols], y_tr), columns=te_col_names, index=X_tr.index)
+        vl_te = pd.DataFrame(te.transform(X_vl[numeric_te_cols]), columns=te_col_names, index=X_vl.index)
+        ts_te = pd.DataFrame(te.transform(X_ts[numeric_te_cols]), columns=te_col_names, index=X_ts.index)
+        X_tr_out = X_tr.drop(columns=numeric_te_cols).join(tr_te)
+        X_vl_out = X_vl.drop(columns=numeric_te_cols).join(vl_te)
+        X_ts_out = X_ts.drop(columns=numeric_te_cols).join(ts_te)
+        return X_tr_out, X_vl_out, X_ts_out
+
+    def prior_correct(raw_proba):
+        corrected = raw_proba / class_priors
+        return corrected / corrected.sum(axis=1, keepdims=True)
+
+    print(f"Total features before TE: {len(features)}")
+
+    optuna_skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=99)
+    pre_splits = list(optuna_skf.split(train[features], train[target_col]))
+
+    def objective(trial):
+        params = {
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
+            'max_leaf_nodes': trial.suggest_int('max_leaf_nodes', 20, 200),
+            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 5, 80),
+            'l2_regularization': trial.suggest_float('l2_regularization', 1e-4, 5.0, log=True),
+            'max_bins': trial.suggest_int('max_bins', 64, 255),
+            'max_iter': 300,
+            'early_stopping': False,
+            'verbose': 0,
+            'categorical_features': categorical_cols,
+            'random_state': 42,
+        }
+
+        scores = []
+        for train_idx, valid_idx in pre_splits:
+            X_tr = train[features].iloc[train_idx].copy()
+            y_tr = train[target_col].iloc[train_idx]
+            X_vl = train[features].iloc[valid_idx].copy()
+            y_vl = train[target_col].iloc[valid_idx]
+            X_ts = test[features].copy()
+
+            X_tr, X_vl, X_ts = apply_te_and_get_splits(X_tr, y_tr, X_vl, X_ts)
+
+            hgbc = HistGradientBoostingClassifier(**params)
+            hgbc.fit(X_tr, y_tr)
+
+            corrected_val = prior_correct(hgbc.predict_proba(X_vl))
+            scores.append(balanced_accuracy_score(y_vl, np.argmax(corrected_val, axis=1)))
+
+        return np.mean(scores)
+
+    print("\nPhase 1: Optuna hyperparameter search (20 trials, 3-fold CV)...")
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=20, show_progress_bar=True)
+
+    best_params = study.best_params
+    print(f"\nBest Optuna CV: {study.best_value:.4f}")
+    print(f"Best params found: {best_params}")
+
+    print("\nPhase 2: Final 7-fold training with best params + 3 seeds...")
+    skf = StratifiedKFold(n_splits=7, shuffle=True, random_state=42)
+    oof_preds = np.zeros((len(train), n_classes))
+    test_preds = np.zeros((len(test), n_classes))
+    seeds = [42, 123, 456]
+
+    final_hgbc_params = {
+        **best_params,
+        'max_iter': 300,
+        'early_stopping': False,
+        'verbose': 0,
+        'categorical_features': categorical_cols,
+    }
 
     for fold, (train_idx, valid_idx) in enumerate(skf.split(train[features], train[target_col])):
         print(f"--- Fold {fold + 1} ---")
-
         X_train = train[features].iloc[train_idx].copy()
         y_train = train[target_col].iloc[train_idx]
         X_valid = train[features].iloc[valid_idx].copy()
         y_valid = train[target_col].iloc[valid_idx]
         X_test = test[features].copy()
 
-        # --- Exact-Value Target Encoding (sklearn TargetEncoder) ---
-        # target_type='multiclass' returns n_features * n_classes columns
-        # For 7 numeric features and 3 classes -> 21 TE columns
-        te = TargetEncoder(
-            target_type='multiclass',
-            smooth='auto',
-            cv=5,
-            random_state=42
-        )
-        te_col_names = [f'{col}_TE_cls{c}' for col in numeric_te_cols for c in range(len(le.classes_))]
+        X_train, X_valid, X_test = apply_te_and_get_splits(X_train, y_train, X_valid, X_test)
 
-        te_train = pd.DataFrame(
-            te.fit_transform(X_train[numeric_te_cols], y_train),
-            columns=te_col_names,
-            index=X_train.index
-        )
-        te_valid = pd.DataFrame(
-            te.transform(X_valid[numeric_te_cols]),
-            columns=te_col_names,
-            index=X_valid.index
-        )
-        te_test_arr = pd.DataFrame(
-            te.transform(X_test[numeric_te_cols]),
-            columns=te_col_names,
-            index=X_test.index
-        )
-
-        # Drop raw numerics and attach TE columns
-        X_train = X_train.drop(columns=numeric_te_cols).join(te_train)
-        X_valid = X_valid.drop(columns=numeric_te_cols).join(te_valid)
-        X_test = X_test.drop(columns=numeric_te_cols).join(te_test_arr)
-
-        # --- HistGradientBoostingClassifier with Seed Averaging ---
-        # Proven breakthrough model (Mark Susol v0.7, 0.95036 LB)
-        # Fix 1: No internal early-stopping validation split — train on full fold data.
-        #         Model was stopping at 127-167 iters, so max_iter=220 is sufficient.
-        # Fix 2: Seed averaging (3 seeds) — reduces the 0.005 fold variance we observed
-        #         without changing model architecture or creating ensemble diversity trap.
-        seeds = [42, 123, 456]
-        fold_val_proba = np.zeros((len(valid_idx), len(le.classes_)))
-        fold_test_proba = np.zeros((len(X_test), len(le.classes_)))
+        fold_val_proba = np.zeros((len(valid_idx), n_classes))
+        fold_test_proba = np.zeros((len(X_test), n_classes))
 
         for seed in seeds:
-            hgbc = HistGradientBoostingClassifier(
-                max_iter=220,
-                learning_rate=0.05,
-                max_leaf_nodes=63,
-                max_depth=None,
-                min_samples_leaf=20,
-                l2_regularization=0.1,
-                early_stopping=False,   # use all fold training data
-                random_state=seed,
-                verbose=0,
-                categorical_features=categorical_cols
-            )
+            hgbc = HistGradientBoostingClassifier(**final_hgbc_params, random_state=seed)
             hgbc.fit(X_train, y_train)
             fold_val_proba += hgbc.predict_proba(X_valid) / len(seeds)
             fold_test_proba += hgbc.predict_proba(X_test) / len(seeds)
 
-        # Prior-Correction: divide raw probabilities by class priors, then renormalize
-        corrected_val = fold_val_proba / class_priors
-        corrected_val = corrected_val / corrected_val.sum(axis=1, keepdims=True)
+        corrected_val = prior_correct(fold_val_proba)
         oof_preds[valid_idx] = corrected_val
 
-        corrected_test = fold_test_proba / class_priors
-        corrected_test = corrected_test / corrected_test.sum(axis=1, keepdims=True)
+        corrected_test = prior_correct(fold_test_proba)
         test_preds += corrected_test / skf.n_splits
 
         fold_score = balanced_accuracy_score(y_valid, np.argmax(corrected_val, axis=1))
         print(f"   Fold {fold + 1} OOF Balanced Accuracy: {fold_score:.4f}")
 
-    # --- Final OOF Score ---
     final_oof_score = balanced_accuracy_score(train[target_col], np.argmax(oof_preds, axis=1))
     print(f"\nOverall OOF Balanced Accuracy: {final_oof_score:.4f}")
 
-    # --- Generate Submission ---
     print("Generating submission file...")
     sub = pd.DataFrame({'id': test['id']})
     sub[target_col] = le.inverse_transform(np.argmax(test_preds, axis=1))
