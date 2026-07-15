@@ -73,6 +73,7 @@ def main():
         X_valid, y_valid = train[features].iloc[valid_idx], train[target_col].iloc[valid_idx]
         
         # --- LightGBM ---
+        print("-> Training LightGBM...")
         lgb_clf = lgb.LGBMClassifier(
             objective='multiclass',
             random_state=42,
@@ -88,29 +89,44 @@ def main():
         lgb_clf.fit(
             X_train, y_train,
             eval_set=[(X_valid, y_valid)],
-            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)]
+            callbacks=[
+                lgb.early_stopping(stopping_rounds=50, verbose=False),
+                lgb.log_evaluation(period=200)
+            ]
         )
         fold_lgb_val = lgb_clf.predict_proba(X_valid)
         lgb_oof_preds[valid_idx] = fold_lgb_val
         lgb_test_preds += lgb_clf.predict_proba(test[features]) / skf.n_splits
+        print("-> LightGBM finished.")
         
         # --- CatBoost ---
-        cb_clf = cb.CatBoostClassifier(
-            loss_function='MultiClass',
-            eval_metric='MultiClass',
-            random_seed=42,
-            auto_class_weights='Balanced',
-            iterations=1500,
-            learning_rate=0.03,
-            depth=6,
-            cat_features=categorical_cols,
-            verbose=False,
-            early_stopping_rounds=50
-        )
-        cb_clf.fit(X_train, y_train, eval_set=(X_valid, y_valid))
+        print("-> Training CatBoost...")
+        cb_params = {
+            'loss_function': 'MultiClass',
+            'eval_metric': 'MultiClass',
+            'random_seed': 42,
+            'auto_class_weights': 'Balanced',
+            'iterations': 1500,
+            'learning_rate': 0.03,
+            'depth': 6,
+            'cat_features': categorical_cols,
+            'early_stopping_rounds': 50,
+            'verbose': 200
+        }
+        
+        try:
+            # Try to use GPU if available on Kaggle
+            cb_clf = cb.CatBoostClassifier(**cb_params, task_type='GPU')
+            cb_clf.fit(X_train, y_train, eval_set=(X_valid, y_valid))
+        except cb.CatBoostError:
+            print("   GPU not detected for CatBoost. Falling back to CPU...")
+            cb_clf = cb.CatBoostClassifier(**cb_params)
+            cb_clf.fit(X_train, y_train, eval_set=(X_valid, y_valid))
+            
         fold_cb_val = cb_clf.predict_proba(X_valid)
         cb_oof_preds[valid_idx] = fold_cb_val
         cb_test_preds += cb_clf.predict_proba(test[features]) / skf.n_splits
+        print("-> CatBoost finished.")
         
         # Evaluate fold individually
         lgb_score = balanced_accuracy_score(y_valid, np.argmax(fold_lgb_val, axis=1))
