@@ -21,14 +21,11 @@ def main():
     
     # --- FEATURE ENGINEERING ---
     def create_features(df):
-        # Prevent division by zero
-        df['calorie_per_step'] = df['calorie_expenditure'] / (df['step_count'] + 1)
-        df['steps_per_exercise'] = df['step_count'] / (df['exercise_duration'] + 1)
-        df['water_per_calorie'] = df['water_intake'] / (df['calorie_expenditure'] + 1)
-        
+        # Removed numerical ratios due to known train/test distribution shifts
         # Categorical interactions
         df['stress_sleep'] = df['stress_level'].astype(str) + "_" + df['sleep_quality'].astype(str)
         df['diet_activity'] = df['diet_type'].astype(str) + "_" + df['physical_activity_level'].astype(str)
+        df['stress_activity'] = df['stress_level'].astype(str) + "_" + df['physical_activity_level'].astype(str)
         return df
 
     print("Creating new features...")
@@ -44,7 +41,7 @@ def main():
     
     categorical_cols = ['diet_type', 'stress_level', 'sleep_quality', 
                         'physical_activity_level', 'smoking_alcohol', 'gender',
-                        'stress_sleep', 'diet_activity']
+                        'stress_sleep', 'diet_activity', 'stress_activity']
     
     # Convert categorical to 'category' dtype for LightGBM
     for col in categorical_cols:
@@ -67,6 +64,9 @@ def main():
         train[col] = train[col].astype('category')
         test[col] = test[col].astype('category')
         
+    # Calculate class priors for Prior-Correction
+    class_priors = train[target_col].value_counts(normalize=True).sort_index().values
+        
     for fold, (train_idx, valid_idx) in enumerate(skf.split(train[features], train[target_col])):
         print(f"--- Fold {fold+1} ---")
         X_train, y_train = train[features].iloc[train_idx], train[target_col].iloc[train_idx]
@@ -77,7 +77,7 @@ def main():
         lgb_clf = lgb.LGBMClassifier(
             objective='multiclass',
             random_state=42,
-            class_weight='balanced',
+            # Removed class_weight='balanced' to use Prior-Correction instead
             n_estimators=1500,
             learning_rate=0.03,
             num_leaves=63,
@@ -94,9 +94,17 @@ def main():
                 lgb.log_evaluation(period=200)
             ]
         )
-        fold_lgb_val = lgb_clf.predict_proba(X_valid)
+        
+        # Prior-Correction for LightGBM
+        raw_lgb_val = lgb_clf.predict_proba(X_valid)
+        fold_lgb_val = raw_lgb_val / class_priors
+        fold_lgb_val = fold_lgb_val / fold_lgb_val.sum(axis=1, keepdims=True)
         lgb_oof_preds[valid_idx] = fold_lgb_val
-        lgb_test_preds += lgb_clf.predict_proba(test[features]) / skf.n_splits
+        
+        raw_lgb_test = lgb_clf.predict_proba(test[features])
+        test_lgb_pred = raw_lgb_test / class_priors
+        test_lgb_pred = test_lgb_pred / test_lgb_pred.sum(axis=1, keepdims=True)
+        lgb_test_preds += test_lgb_pred / skf.n_splits
         print("-> LightGBM finished.")
         
         # --- CatBoost ---
@@ -105,7 +113,7 @@ def main():
             'loss_function': 'MultiClass',
             'eval_metric': 'MultiClass',
             'random_seed': 42,
-            'auto_class_weights': 'Balanced',
+            # Removed auto_class_weights='Balanced' to use Prior-Correction instead
             'iterations': 1500,
             'learning_rate': 0.03,
             'depth': 6,
@@ -123,9 +131,16 @@ def main():
             cb_clf = cb.CatBoostClassifier(**cb_params)
             cb_clf.fit(X_train, y_train, eval_set=(X_valid, y_valid))
             
-        fold_cb_val = cb_clf.predict_proba(X_valid)
+        # Prior-Correction for CatBoost
+        raw_cb_val = cb_clf.predict_proba(X_valid)
+        fold_cb_val = raw_cb_val / class_priors
+        fold_cb_val = fold_cb_val / fold_cb_val.sum(axis=1, keepdims=True)
         cb_oof_preds[valid_idx] = fold_cb_val
-        cb_test_preds += cb_clf.predict_proba(test[features]) / skf.n_splits
+        
+        raw_cb_test = cb_clf.predict_proba(test[features])
+        test_cb_pred = raw_cb_test / class_priors
+        test_cb_pred = test_cb_pred / test_cb_pred.sum(axis=1, keepdims=True)
+        cb_test_preds += test_cb_pred / skf.n_splits
         print("-> CatBoost finished.")
         
         # Evaluate fold individually
