@@ -79,17 +79,36 @@ def main():
         X_test = test[features].copy()
 
         # --- Exact-Value Target Encoding (sklearn TargetEncoder) ---
-        # This is the proven +0.0009 lever. Applied cross-fit inside the fold to prevent leakage.
-        # smooth='auto' uses empirical Bayes shrinkage to avoid overfitting rare values.
+        # target_type='multiclass' returns n_features * n_classes columns
+        # For 7 numeric features and 3 classes -> 21 TE columns
         te = TargetEncoder(
             target_type='multiclass',
             smooth='auto',
-            cv=5,           # inner cross-fitting for leakage prevention
+            cv=5,
             random_state=42
         )
-        X_train[numeric_te_cols] = te.fit_transform(X_train[numeric_te_cols], y_train)
-        X_valid[numeric_te_cols] = te.transform(X_valid[numeric_te_cols])
-        X_test[numeric_te_cols] = te.transform(X_test[numeric_te_cols])
+        te_col_names = [f'{col}_TE_cls{c}' for col in numeric_te_cols for c in range(len(le.classes_))]
+
+        te_train = pd.DataFrame(
+            te.fit_transform(X_train[numeric_te_cols], y_train),
+            columns=te_col_names,
+            index=X_train.index
+        )
+        te_valid = pd.DataFrame(
+            te.transform(X_valid[numeric_te_cols]),
+            columns=te_col_names,
+            index=X_valid.index
+        )
+        te_test_arr = pd.DataFrame(
+            te.transform(X_test[numeric_te_cols]),
+            columns=te_col_names,
+            index=X_test.index
+        )
+
+        # Drop raw numerics and attach TE columns
+        X_train = X_train.drop(columns=numeric_te_cols).join(te_train)
+        X_valid = X_valid.drop(columns=numeric_te_cols).join(te_valid)
+        X_test = X_test.drop(columns=numeric_te_cols).join(te_test_arr)
 
         # --- HistGradientBoostingClassifier ---
         # Proven breakthrough model (Mark Susol v0.7, 0.95036 LB)
