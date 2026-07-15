@@ -10,10 +10,9 @@ warnings.filterwarnings('ignore')
 
 def main():
     # Kaggle cloud environment paths
-    train_path = '/kaggle/input/playground-series-s6e7/train.csv'
-    test_path = '/kaggle/input/playground-series-s6e7/test.csv'
     submission_path = '/kaggle/working/submission.csv'
-    
+    train_path = "/kaggle/input/competitions/playground-series-s6e7/train.csv"
+    test_path = "/kaggle/input/competitions/playground-series-s6e7/test.csv"
     print("Loading datasets...")
     train = pd.read_csv(train_path)
     test = pd.read_csv(test_path)
