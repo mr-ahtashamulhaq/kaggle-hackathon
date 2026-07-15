@@ -67,11 +67,37 @@ def main():
     # Calculate class priors for Prior-Correction
     class_priors = train[target_col].value_counts(normalize=True).sort_index().values
         
+    num_cols = ['sleep_duration', 'heart_rate', 'bmi', 'calorie_expenditure', 'step_count', 'exercise_duration', 'water_intake']
+    for col in num_cols:
+        train[f'{col}_bin'] = pd.qcut(train[col], q=15, labels=False, duplicates='drop').fillna(-1)
+        test[f'{col}_bin'] = pd.qcut(test[col], q=15, labels=False, duplicates='drop').fillna(-1)
+
     for fold, (train_idx, valid_idx) in enumerate(skf.split(train[features], train[target_col])):
         print(f"--- Fold {fold+1} ---")
-        X_train, y_train = train[features].iloc[train_idx], train[target_col].iloc[train_idx]
-        X_valid, y_valid = train[features].iloc[valid_idx], train[target_col].iloc[valid_idx]
+        X_train = train[features].iloc[train_idx].copy()
+        y_train = train[target_col].iloc[train_idx]
+        X_valid = train[features].iloc[valid_idx].copy()
+        y_valid = train[target_col].iloc[valid_idx]
+        X_test = test[features].copy()
         
+        # Dynamic Target Encoding inside the fold to prevent leakage
+        train_bins = train[[f'{col}_bin' for col in num_cols]].iloc[train_idx]
+        valid_bins = train[[f'{col}_bin' for col in num_cols]].iloc[valid_idx]
+        test_bins = test[[f'{col}_bin' for col in num_cols]]
+        
+        te_features = []
+        for col in num_cols:
+            bin_col = f'{col}_bin'
+            for class_val in range(len(le.classes_)):
+                feat_name = f'{col}_TE_class_{class_val}'
+                means = (y_train == class_val).groupby(train_bins[bin_col]).mean()
+                global_mean = (y_train == class_val).mean()
+                
+                X_train[feat_name] = train_bins[bin_col].map(means).fillna(global_mean)
+                X_valid[feat_name] = valid_bins[bin_col].map(means).fillna(global_mean)
+                X_test[feat_name] = test_bins[bin_col].map(means).fillna(global_mean)
+                te_features.append(feat_name)
+                
         # --- LightGBM ---
         print("-> Training LightGBM...")
         lgb_clf = lgb.LGBMClassifier(
@@ -101,7 +127,7 @@ def main():
         fold_lgb_val = fold_lgb_val / fold_lgb_val.sum(axis=1, keepdims=True)
         lgb_oof_preds[valid_idx] = fold_lgb_val
         
-        raw_lgb_test = lgb_clf.predict_proba(test[features])
+        raw_lgb_test = lgb_clf.predict_proba(X_test)
         test_lgb_pred = raw_lgb_test / class_priors
         test_lgb_pred = test_lgb_pred / test_lgb_pred.sum(axis=1, keepdims=True)
         lgb_test_preds += test_lgb_pred / skf.n_splits
@@ -137,7 +163,7 @@ def main():
         fold_cb_val = fold_cb_val / fold_cb_val.sum(axis=1, keepdims=True)
         cb_oof_preds[valid_idx] = fold_cb_val
         
-        raw_cb_test = cb_clf.predict_proba(test[features])
+        raw_cb_test = cb_clf.predict_proba(X_test)
         test_cb_pred = raw_cb_test / class_priors
         test_cb_pred = test_cb_pred / test_cb_pred.sum(axis=1, keepdims=True)
         cb_test_preds += test_cb_pred / skf.n_splits
