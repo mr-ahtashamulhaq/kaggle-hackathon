@@ -6,6 +6,7 @@ from sklearn.metrics import balanced_accuracy_score
 import lightgbm as lgb
 import catboost as cb
 from sklearn.preprocessing import LabelEncoder
+from scipy.optimize import minimize
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -53,8 +54,10 @@ def main():
     print("Starting Stratified K-Fold (K=5) training with LightGBM & CatBoost Blend...")
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     
-    oof_preds = np.zeros((len(train), len(le.classes_)))
-    test_preds = np.zeros((len(test), len(le.classes_)))
+    lgb_oof_preds = np.zeros((len(train), len(le.classes_)))
+    cb_oof_preds = np.zeros((len(train), len(le.classes_)))
+    lgb_test_preds = np.zeros((len(test), len(le.classes_)))
+    cb_test_preds = np.zeros((len(test), len(le.classes_)))
     
     # Convert categories to str for CatBoost compatibility just in case
     for col in categorical_cols:
@@ -87,8 +90,9 @@ def main():
             eval_set=[(X_valid, y_valid)],
             callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)]
         )
-        lgb_val_preds = lgb_clf.predict_proba(X_valid)
-        lgb_test_preds = lgb_clf.predict_proba(test[features])
+        fold_lgb_val = lgb_clf.predict_proba(X_valid)
+        lgb_oof_preds[valid_idx] = fold_lgb_val
+        lgb_test_preds += lgb_clf.predict_proba(test[features]) / skf.n_splits
         
         # --- CatBoost ---
         cb_clf = cb.CatBoostClassifier(
@@ -104,29 +108,45 @@ def main():
             early_stopping_rounds=50
         )
         cb_clf.fit(X_train, y_train, eval_set=(X_valid, y_valid))
-        cb_val_preds = cb_clf.predict_proba(X_valid)
-        cb_test_preds = cb_clf.predict_proba(test[features])
+        fold_cb_val = cb_clf.predict_proba(X_valid)
+        cb_oof_preds[valid_idx] = fold_cb_val
+        cb_test_preds += cb_clf.predict_proba(test[features]) / skf.n_splits
         
-        # --- Blend (50/50) ---
-        val_preds = 0.5 * lgb_val_preds + 0.5 * cb_val_preds
-        oof_preds[valid_idx] = val_preds
+        # Evaluate fold individually
+        lgb_score = balanced_accuracy_score(y_valid, np.argmax(fold_lgb_val, axis=1))
+        cb_score = balanced_accuracy_score(y_valid, np.argmax(fold_cb_val, axis=1))
+        blend_score = balanced_accuracy_score(y_valid, np.argmax(0.5 * fold_lgb_val + 0.5 * fold_cb_val, axis=1))
         
-        test_preds += (0.5 * lgb_test_preds + 0.5 * cb_test_preds) / skf.n_splits
+        print(f"Fold {fold+1} Scores -> LGBM: {lgb_score:.4f} | CB: {cb_score:.4f} | 50/50 Blend: {blend_score:.4f}")
         
-        # Evaluate fold
-        val_pred_classes = np.argmax(val_preds, axis=1)
-        fold_score = balanced_accuracy_score(y_valid, val_pred_classes)
-        print(f"Fold {fold+1} Blended Balanced Accuracy: {fold_score:.4f}")
-        
-    # Overall OOF score
-    oof_pred_classes = np.argmax(oof_preds, axis=1)
-    oof_score = balanced_accuracy_score(train[target_col], oof_pred_classes)
-    print(f"Overall OOF Balanced Accuracy: {oof_score:.4f}")
+    # --- Post-Training Optimization ---
+    print("\nOptimizing blend weights using Nelder-Mead...")
+    
+    def loss_func(weights):
+        w1, w2 = weights
+        if w1 < 0 or w2 < 0 or (w1 + w2) == 0:
+            return 9999.0 # heavily penalize invalid weights
+        # normalize
+        w1, w2 = w1 / (w1+w2), w2 / (w1+w2)
+        blended = w1 * lgb_oof_preds + w2 * cb_oof_preds
+        # Negate because minimize finds minimum, we want maximum balanced accuracy
+        return -balanced_accuracy_score(train[target_col], np.argmax(blended, axis=1))
+    
+    res = minimize(loss_func, [0.5, 0.5], method='Nelder-Mead', tol=1e-4)
+    best_w1, best_w2 = res.x
+    best_w1, best_w2 = best_w1 / (best_w1+best_w2), best_w2 / (best_w1+best_w2)
+    
+    print(f"Optimal Weights -> LGBM: {best_w1:.4f} | CB: {best_w2:.4f}")
+    
+    # Calculate final OOF score
+    final_oof_preds = best_w1 * lgb_oof_preds + best_w2 * cb_oof_preds
+    final_oof_score = balanced_accuracy_score(train[target_col], np.argmax(final_oof_preds, axis=1))
+    print(f"Overall OOF Balanced Accuracy (Optimized): {final_oof_score:.4f}")
     
     print("Generating submission file...")
     sub = pd.DataFrame({'id': test['id']})
-    test_pred_classes = np.argmax(test_preds, axis=1)
-    sub[target_col] = le.inverse_transform(test_pred_classes)
+    final_test_preds = best_w1 * lgb_test_preds + best_w2 * cb_test_preds
+    sub[target_col] = le.inverse_transform(np.argmax(final_test_preds, axis=1))
     sub.to_csv(submission_path, index=False)
     print(f"Submission saved successfully to {submission_path}")
 
