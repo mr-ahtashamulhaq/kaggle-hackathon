@@ -54,6 +54,16 @@ def main():
         train[col] = train[col].astype('category').cat.codes.astype('int16')
         test[col] = test[col].astype('category').cat.codes.astype('int16')
 
+    # Explicit missingness indicators
+    # The MNAR signal is real (community-proven). HGBC learns it implicitly via split
+    # directions, but making it an explicit binary feature gives the model a direct handle.
+    nan_indicator_cols = []
+    for col in numeric_te_cols:
+        nan_col = f'{col}_is_nan'
+        train[nan_col] = train[col].isna().astype(np.int8)
+        test[nan_col] = test[col].isna().astype(np.int8)
+        nan_indicator_cols.append(nan_col)
+
     features = [c for c in train.columns if c not in ['id', target_col]]
 
     print(f"Total features: {len(features)}")
