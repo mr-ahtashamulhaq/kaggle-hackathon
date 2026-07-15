@@ -5,6 +5,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import balanced_accuracy_score
 import lightgbm as lgb
 import catboost as cb
+import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder
 from scipy.optimize import minimize
 import warnings
@@ -53,8 +54,10 @@ def main():
     
     lgb_oof_preds = np.zeros((len(train), len(le.classes_)))
     cb_oof_preds = np.zeros((len(train), len(le.classes_)))
+    xgb_oof_preds = np.zeros((len(train), len(le.classes_)))
     lgb_test_preds = np.zeros((len(test), len(le.classes_)))
     cb_test_preds = np.zeros((len(test), len(le.classes_)))
+    xgb_test_preds = np.zeros((len(test), len(le.classes_)))
     
     # Convert categories to str for CatBoost compatibility just in case
     for col in categorical_cols:
@@ -169,40 +172,86 @@ def main():
         cb_test_preds += test_cb_pred / skf.n_splits
         print("-> CatBoost finished.")
         
+        # --- XGBoost ---
+        print("-> Training XGBoost...")
+        xgb_clf = xgb.XGBClassifier(
+            objective='multi:softprob',
+            num_class=3,
+            random_state=42,
+            n_estimators=1500,
+            learning_rate=0.03,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            tree_method='hist',
+            device='cuda',
+            enable_categorical=True,
+            early_stopping_rounds=50
+        )
+        try:
+            xgb_clf.fit(
+                X_train, y_train,
+                eval_set=[(X_valid, y_valid)],
+                verbose=200
+            )
+        except Exception as e:
+            print(f"   GPU XGBoost failed, falling back to CPU...")
+            xgb_clf.set_params(device='cpu')
+            xgb_clf.fit(
+                X_train, y_train,
+                eval_set=[(X_valid, y_valid)],
+                verbose=200
+            )
+            
+        # Prior-Correction for XGBoost
+        raw_xgb_val = xgb_clf.predict_proba(X_valid)
+        fold_xgb_val = raw_xgb_val / class_priors
+        fold_xgb_val = fold_xgb_val / fold_xgb_val.sum(axis=1, keepdims=True)
+        xgb_oof_preds[valid_idx] = fold_xgb_val
+        
+        raw_xgb_test = xgb_clf.predict_proba(X_test)
+        test_xgb_pred = raw_xgb_test / class_priors
+        test_xgb_pred = test_xgb_pred / test_xgb_pred.sum(axis=1, keepdims=True)
+        xgb_test_preds += test_xgb_pred / skf.n_splits
+        print("-> XGBoost finished.")
+        
         # Evaluate fold individually
         lgb_score = balanced_accuracy_score(y_valid, np.argmax(fold_lgb_val, axis=1))
         cb_score = balanced_accuracy_score(y_valid, np.argmax(fold_cb_val, axis=1))
-        blend_score = balanced_accuracy_score(y_valid, np.argmax(0.5 * fold_lgb_val + 0.5 * fold_cb_val, axis=1))
+        xgb_score = balanced_accuracy_score(y_valid, np.argmax(fold_xgb_val, axis=1))
+        blend_score = balanced_accuracy_score(y_valid, np.argmax(0.33 * fold_lgb_val + 0.33 * fold_cb_val + 0.34 * fold_xgb_val, axis=1))
         
-        print(f"Fold {fold+1} Scores -> LGBM: {lgb_score:.4f} | CB: {cb_score:.4f} | 50/50 Blend: {blend_score:.4f}")
+        print(f"Fold {fold+1} Scores -> LGBM: {lgb_score:.4f} | CB: {cb_score:.4f} | XGB: {xgb_score:.4f} | Mean Blend: {blend_score:.4f}")
         
     # --- Post-Training Optimization ---
-    print("\nOptimizing blend weights using Nelder-Mead...")
+    print("\nOptimizing 3-way blend weights using Nelder-Mead...")
     
     def loss_func(weights):
-        w1, w2 = weights
-        if w1 < 0 or w2 < 0 or (w1 + w2) == 0:
+        w1, w2, w3 = weights
+        if w1 < 0 or w2 < 0 or w3 < 0 or (w1 + w2 + w3) == 0:
             return 9999.0 # heavily penalize invalid weights
         # normalize
-        w1, w2 = w1 / (w1+w2), w2 / (w1+w2)
-        blended = w1 * lgb_oof_preds + w2 * cb_oof_preds
+        total_w = w1 + w2 + w3
+        w1, w2, w3 = w1/total_w, w2/total_w, w3/total_w
+        blended = w1 * lgb_oof_preds + w2 * cb_oof_preds + w3 * xgb_oof_preds
         # Negate because minimize finds minimum, we want maximum balanced accuracy
         return -balanced_accuracy_score(train[target_col], np.argmax(blended, axis=1))
     
-    res = minimize(loss_func, [0.5, 0.5], method='Nelder-Mead', tol=1e-4)
-    best_w1, best_w2 = res.x
-    best_w1, best_w2 = best_w1 / (best_w1+best_w2), best_w2 / (best_w1+best_w2)
+    res = minimize(loss_func, [0.33, 0.33, 0.34], method='Nelder-Mead', tol=1e-4)
+    best_w1, best_w2, best_w3 = res.x
+    total_best_w = best_w1 + best_w2 + best_w3
+    best_w1, best_w2, best_w3 = best_w1/total_best_w, best_w2/total_best_w, best_w3/total_best_w
     
-    print(f"Optimal Weights -> LGBM: {best_w1:.4f} | CB: {best_w2:.4f}")
+    print(f"Optimal Weights -> LGBM: {best_w1:.4f} | CB: {best_w2:.4f} | XGB: {best_w3:.4f}")
     
     # Calculate final OOF score
-    final_oof_preds = best_w1 * lgb_oof_preds + best_w2 * cb_oof_preds
+    final_oof_preds = best_w1 * lgb_oof_preds + best_w2 * cb_oof_preds + best_w3 * xgb_oof_preds
     final_oof_score = balanced_accuracy_score(train[target_col], np.argmax(final_oof_preds, axis=1))
     print(f"Overall OOF Balanced Accuracy (Optimized): {final_oof_score:.4f}")
     
     print("Generating submission file...")
     sub = pd.DataFrame({'id': test['id']})
-    final_test_preds = best_w1 * lgb_test_preds + best_w2 * cb_test_preds
+    final_test_preds = best_w1 * lgb_test_preds + best_w2 * cb_test_preds + best_w3 * xgb_test_preds
     sub[target_col] = le.inverse_transform(np.argmax(final_test_preds, axis=1))
     sub.to_csv(submission_path, index=False)
     print(f"Submission saved successfully to {submission_path}")
