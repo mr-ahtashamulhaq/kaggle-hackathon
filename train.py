@@ -186,20 +186,20 @@ def main():
             ).to(DEVICE)
 
             optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30, eta_min=1e-5)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=60, eta_min=1e-5)
             scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
 
             best_val_loss = float('inf')
             best_state = None
-            patience, no_improve = 6, 0
+            patience, no_improve = 8, 0
 
-            for epoch in range(30):
+            for epoch in range(60):
                 model.train()
                 for xc, xn, y in tr_ld:
                     xc, xn, y = xc.to(DEVICE), xn.to(DEVICE), y.to(DEVICE)
                     optimizer.zero_grad()
                     with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                        loss = F.cross_entropy(model(xc, xn), y, weight=cw)
+                        loss = F.cross_entropy(model(xc, xn), y)
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -213,7 +213,7 @@ def main():
                     for xc, xn, y in vl_ld:
                         xc, xn, y = xc.to(DEVICE), xn.to(DEVICE), y.to(DEVICE)
                         with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                            vl_loss += F.cross_entropy(model(xc, xn), y, weight=cw).item()
+                            vl_loss += F.cross_entropy(model(xc, xn), y).item()
                 vl_loss /= len(vl_ld)
 
                 if vl_loss < best_val_loss:
@@ -223,7 +223,7 @@ def main():
                 else:
                     no_improve += 1
 
-                if (epoch + 1) % 5 == 0:
+                if (epoch + 1) % 10 == 0:
                     print(f"  [seed={seed}] Epoch {epoch+1}: val_loss={vl_loss:.5f} (best={best_val_loss:.5f})")
 
                 if no_improve >= patience:
