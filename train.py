@@ -1,16 +1,88 @@
-import pandas as pd
+import os
+import gc
+import random
 import numpy as np
+import pandas as pd
 from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import balanced_accuracy_score
-from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.preprocessing import LabelEncoder, TargetEncoder
-import optuna
+from sklearn.preprocessing import LabelEncoder
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
 import warnings
 warnings.filterwarnings('ignore')
-optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+class TabDataset(Dataset):
+    def __init__(self, x_cat, x_num, y=None):
+        self.x_cat = torch.tensor(x_cat, dtype=torch.long)
+        self.x_num = torch.tensor(x_num, dtype=torch.float32)
+        self.y = None if y is None else torch.tensor(y, dtype=torch.long)
+
+    def __len__(self):
+        return len(self.x_cat)
+
+    def __getitem__(self, idx):
+        if self.y is not None:
+            return self.x_cat[idx], self.x_num[idx], self.y[idx]
+        return self.x_cat[idx], self.x_num[idx]
+
+
+class FTTransformer(nn.Module):
+    def __init__(self, cat_cards, n_num, d=64, heads=8, layers=4, drop=0.1, n_cls=3):
+        super().__init__()
+        self.cat_embs = nn.ModuleList([nn.Embedding(c + 2, d) for c in cat_cards])
+        self.num_toks = nn.ModuleList([nn.Linear(1, d) for _ in range(n_num)])
+        self.cls_tok = nn.Parameter(torch.zeros(1, 1, d))
+        enc = nn.TransformerEncoderLayer(
+            d_model=d, nhead=heads, dim_feedforward=d * 4,
+            dropout=drop, batch_first=True, norm_first=True
+        )
+        self.tfm = nn.TransformerEncoder(enc, num_layers=layers)
+        self.head = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, n_cls))
+
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        nn.init.zeros_(self.cls_tok)
+
+    def forward(self, cat, num):
+        B = cat.shape[0]
+        cat_t = torch.stack([self.cat_embs[i](cat[:, i]) for i in range(cat.shape[1])], dim=1)
+        num_t = torch.stack([self.num_toks[i](num[:, i:i+1]) for i in range(num.shape[1])], dim=1)
+        x = torch.cat([self.cls_tok.expand(B, -1, -1), cat_t, num_t], dim=1)
+        return self.head(self.tfm(x)[:, 0])
+
+
+def get_probas(model, loader):
+    model.eval()
+    preds = []
+    with torch.no_grad():
+        for batch in loader:
+            xc, xn = batch[0].to(DEVICE), batch[1].to(DEVICE)
+            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                logits = model(xc, xn)
+            preds.append(F.softmax(logits.float(), dim=-1).cpu().numpy())
+    return np.vstack(preds)
 
 
 def main():
+    print(f"Device: {DEVICE}")
     submission_path = '/kaggle/working/submission.csv'
     train_path = "/kaggle/input/competitions/playground-series-s6e7/train.csv"
     test_path = "/kaggle/input/competitions/playground-series-s6e7/test.csv"
@@ -32,129 +104,155 @@ def main():
     target_col = 'health_condition'
     le = LabelEncoder()
     train[target_col] = le.fit_transform(train[target_col])
+    n_classes = len(le.classes_)
 
-    categorical_cols = [
-        'diet_type', 'stress_level', 'sleep_quality',
-        'physical_activity_level', 'smoking_alcohol', 'gender',
-        'stress_sleep', 'diet_activity', 'stress_activity'
+    cat_cols = [
+        'diet_type', 'stress_level', 'sleep_quality', 'physical_activity_level',
+        'smoking_alcohol', 'gender', 'stress_sleep', 'diet_activity', 'stress_activity'
     ]
-    numeric_te_cols = [
+    num_cols = [
         'sleep_duration', 'heart_rate', 'bmi',
         'calorie_expenditure', 'step_count', 'exercise_duration', 'water_intake'
     ]
 
-    for col in categorical_cols:
-        train[col] = train[col].astype('category').cat.codes.astype('int16')
-        test[col] = test[col].astype('category').cat.codes.astype('int16')
+    # NaN indicators BEFORE imputation — the MNAR signal
+    for col in num_cols:
+        train[f'{col}_nan'] = train[col].isna().astype(np.float32)
+        test[f'{col}_nan'] = test[col].isna().astype(np.float32)
+    nan_cols = [f'{col}_nan' for col in num_cols]
 
-    features = [c for c in train.columns if c not in ['id', target_col]]
-    n_classes = len(le.classes_)
-    te_col_names = [f'{col}_TE_cls{c}' for col in numeric_te_cols for c in range(n_classes)]
-    class_priors = train[target_col].value_counts(normalize=True).sort_index().values
+    # Mean imputation using training set mean only
+    for col in num_cols:
+        m = train[col].mean()
+        train[col] = train[col].fillna(m)
+        test[col] = test[col].fillna(m)
 
-    def apply_te_and_get_splits(X_tr, y_tr, X_vl, X_ts):
-        te = TargetEncoder(target_type='multiclass', smooth='auto', cv=5, random_state=42)
-        tr_te = pd.DataFrame(te.fit_transform(X_tr[numeric_te_cols], y_tr), columns=te_col_names, index=X_tr.index)
-        vl_te = pd.DataFrame(te.transform(X_vl[numeric_te_cols]), columns=te_col_names, index=X_vl.index)
-        ts_te = pd.DataFrame(te.transform(X_ts[numeric_te_cols]), columns=te_col_names, index=X_ts.index)
-        X_tr_out = X_tr.drop(columns=numeric_te_cols).join(tr_te)
-        X_vl_out = X_vl.drop(columns=numeric_te_cols).join(vl_te)
-        X_ts_out = X_ts.drop(columns=numeric_te_cols).join(ts_te)
-        return X_tr_out, X_vl_out, X_ts_out
+    # Z-score normalization (fit on train, apply to both)
+    for col in num_cols:
+        mu, std = train[col].mean(), train[col].std() + 1e-8
+        train[col] = ((train[col] - mu) / std).astype(np.float32)
+        test[col] = ((test[col] - mu) / std).astype(np.float32)
 
-    def prior_correct(raw_proba):
-        corrected = raw_proba / class_priors
-        return corrected / corrected.sum(axis=1, keepdims=True)
+    # Integer-encode categoricals (fit on combined train+test for vocabulary)
+    cat_cardinalities = []
+    for col in cat_cols:
+        combined = pd.concat([train[col].astype(str), test[col].astype(str)], ignore_index=True)
+        cats = combined.astype('category').cat.categories
+        cat_cardinalities.append(len(cats))
+        train[col] = pd.Categorical(train[col].astype(str), categories=cats).codes
+        test[col] = pd.Categorical(test[col].astype(str), categories=cats).codes
 
-    print(f"Total features before TE: {len(features)}")
+    all_num_cols = num_cols + nan_cols
+    n_numeric = len(all_num_cols)
 
-    optuna_skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=99)
-    pre_splits = list(optuna_skf.split(train[features], train[target_col]))
+    X_cat = train[cat_cols].values.astype(np.int64)
+    X_num = train[all_num_cols].values.astype(np.float32)
+    y_all = train[target_col].values.astype(np.int64)
 
-    def objective(trial):
-        params = {
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.15, log=True),
-            'max_leaf_nodes': trial.suggest_int('max_leaf_nodes', 20, 200),
-            'min_samples_leaf': trial.suggest_int('min_samples_leaf', 5, 80),
-            'l2_regularization': trial.suggest_float('l2_regularization', 1e-4, 5.0, log=True),
-            'max_bins': trial.suggest_int('max_bins', 64, 255),
-            'max_iter': 300,
-            'early_stopping': False,
-            'verbose': 0,
-            'categorical_features': categorical_cols,
-            'random_state': 42,
-        }
+    X_cat_test = test[cat_cols].values.astype(np.int64)
+    X_num_test = test[all_num_cols].values.astype(np.float32)
 
-        scores = []
-        for train_idx, valid_idx in pre_splits:
-            X_tr = train[features].iloc[train_idx].copy()
-            y_tr = train[target_col].iloc[train_idx]
-            X_vl = train[features].iloc[valid_idx].copy()
-            y_vl = train[target_col].iloc[valid_idx]
-            X_ts = test[features].copy()
+    class_priors = np.bincount(y_all) / len(y_all)
+    cw = torch.tensor(1.0 / (class_priors * n_classes), dtype=torch.float32).to(DEVICE)
+    print(f"Class priors: {class_priors.round(4)}")
+    print(f"Features: {len(cat_cols)} cat + {n_numeric} num = {len(cat_cols) + n_numeric} total")
 
-            X_tr, X_vl, X_ts = apply_te_and_get_splits(X_tr, y_tr, X_vl, X_ts)
-
-            hgbc = HistGradientBoostingClassifier(**params)
-            hgbc.fit(X_tr, y_tr)
-
-            corrected_val = prior_correct(hgbc.predict_proba(X_vl))
-            scores.append(balanced_accuracy_score(y_vl, np.argmax(corrected_val, axis=1)))
-
-        return np.mean(scores)
-
-    print("\nPhase 1: Optuna hyperparameter search (20 trials, 3-fold CV)...")
-    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=42))
-    study.optimize(objective, n_trials=20, show_progress_bar=True)
-
-    best_params = study.best_params
-    print(f"\nBest Optuna CV: {study.best_value:.4f}")
-    print(f"Best params found: {best_params}")
-
-    print("\nPhase 2: Final 7-fold training with best params + 3 seeds...")
-    skf = StratifiedKFold(n_splits=7, shuffle=True, random_state=42)
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     oof_preds = np.zeros((len(train), n_classes))
     test_preds = np.zeros((len(test), n_classes))
-    seeds = [42, 123, 456]
+    seeds = [42, 123]
 
-    final_hgbc_params = {
-        **best_params,
-        'max_iter': 300,
-        'early_stopping': False,
-        'verbose': 0,
-        'categorical_features': categorical_cols,
-    }
+    print("\nStarting 5-fold FT-Transformer training (2 seeds per fold)...")
 
-    for fold, (train_idx, valid_idx) in enumerate(skf.split(train[features], train[target_col])):
-        print(f"--- Fold {fold + 1} ---")
-        X_train = train[features].iloc[train_idx].copy()
-        y_train = train[target_col].iloc[train_idx]
-        X_valid = train[features].iloc[valid_idx].copy()
-        y_valid = train[target_col].iloc[valid_idx]
-        X_test = test[features].copy()
-
-        X_train, X_valid, X_test = apply_te_and_get_splits(X_train, y_train, X_valid, X_test)
-
-        fold_val_proba = np.zeros((len(valid_idx), n_classes))
-        fold_test_proba = np.zeros((len(X_test), n_classes))
+    for fold, (tr_idx, vl_idx) in enumerate(skf.split(X_cat, y_all)):
+        print(f"\n--- Fold {fold + 1}/5 ---")
+        fold_val_proba = np.zeros((len(vl_idx), n_classes))
+        fold_test_proba = np.zeros((len(X_cat_test), n_classes))
 
         for seed in seeds:
-            hgbc = HistGradientBoostingClassifier(**final_hgbc_params, random_state=seed)
-            hgbc.fit(X_train, y_train)
-            fold_val_proba += hgbc.predict_proba(X_valid) / len(seeds)
-            fold_test_proba += hgbc.predict_proba(X_test) / len(seeds)
+            set_seed(seed)
 
-        corrected_val = prior_correct(fold_val_proba)
-        oof_preds[valid_idx] = corrected_val
+            tr_ds = TabDataset(X_cat[tr_idx], X_num[tr_idx], y_all[tr_idx])
+            vl_ds = TabDataset(X_cat[vl_idx], X_num[vl_idx], y_all[vl_idx])
+            ts_ds = TabDataset(X_cat_test, X_num_test)
 
-        corrected_test = prior_correct(fold_test_proba)
+            tr_ld = DataLoader(tr_ds, batch_size=4096, shuffle=True, num_workers=2, pin_memory=True)
+            vl_ld = DataLoader(vl_ds, batch_size=8192, shuffle=False, num_workers=2, pin_memory=True)
+            ts_ld = DataLoader(ts_ds, batch_size=8192, shuffle=False, num_workers=2, pin_memory=True)
+
+            model = FTTransformer(
+                cat_cards=cat_cardinalities, n_num=n_numeric,
+                d=64, heads=8, layers=4, drop=0.1, n_cls=n_classes
+            ).to(DEVICE)
+
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=30, eta_min=1e-5)
+            scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+
+            best_val_loss = float('inf')
+            best_state = None
+            patience, no_improve = 6, 0
+
+            for epoch in range(30):
+                model.train()
+                for xc, xn, y in tr_ld:
+                    xc, xn, y = xc.to(DEVICE), xn.to(DEVICE), y.to(DEVICE)
+                    optimizer.zero_grad()
+                    with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                        loss = F.cross_entropy(model(xc, xn), y, weight=cw)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                scheduler.step()
+
+                model.eval()
+                vl_loss = 0.0
+                with torch.no_grad():
+                    for xc, xn, y in vl_ld:
+                        xc, xn, y = xc.to(DEVICE), xn.to(DEVICE), y.to(DEVICE)
+                        with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                            vl_loss += F.cross_entropy(model(xc, xn), y, weight=cw).item()
+                vl_loss /= len(vl_ld)
+
+                if vl_loss < best_val_loss:
+                    best_val_loss = vl_loss
+                    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                    no_improve = 0
+                else:
+                    no_improve += 1
+
+                if (epoch + 1) % 5 == 0:
+                    print(f"  [seed={seed}] Epoch {epoch+1}: val_loss={vl_loss:.5f} (best={best_val_loss:.5f})")
+
+                if no_improve >= patience:
+                    print(f"  [seed={seed}] Early stop @ epoch {epoch+1}")
+                    break
+
+            model.load_state_dict(best_state)
+            fold_val_proba += get_probas(model, vl_ld) / len(seeds)
+            fold_test_proba += get_probas(model, ts_ld) / len(seeds)
+
+            del model, optimizer, scheduler, scaler
+            del tr_ds, vl_ds, ts_ds, tr_ld, vl_ld, ts_ld, best_state
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        corrected_val = fold_val_proba / class_priors
+        corrected_val /= corrected_val.sum(axis=1, keepdims=True)
+        oof_preds[vl_idx] = corrected_val
+
+        corrected_test = fold_test_proba / class_priors
+        corrected_test /= corrected_test.sum(axis=1, keepdims=True)
         test_preds += corrected_test / skf.n_splits
 
-        fold_score = balanced_accuracy_score(y_valid, np.argmax(corrected_val, axis=1))
-        print(f"   Fold {fold + 1} OOF Balanced Accuracy: {fold_score:.4f}")
+        fold_score = balanced_accuracy_score(y_all[vl_idx], np.argmax(corrected_val, axis=1))
+        print(f"Fold {fold + 1} OOF Balanced Accuracy: {fold_score:.4f}")
 
-    final_oof_score = balanced_accuracy_score(train[target_col], np.argmax(oof_preds, axis=1))
-    print(f"\nOverall OOF Balanced Accuracy: {final_oof_score:.4f}")
+    final_oof = balanced_accuracy_score(y_all, np.argmax(oof_preds, axis=1))
+    print(f"\nOverall OOF Balanced Accuracy: {final_oof:.4f}")
 
     print("Generating submission file...")
     sub = pd.DataFrame({'id': test['id']})
